@@ -94,6 +94,27 @@
           <p class="empty">录入站点与班次后点击「规划行程」。</p>
         </div>
       </div>
+
+      <div class="card continue-card" id="continue-card" hidden>
+        <h2>⑦ 途中停运 / 班次调整后续程</h2>
+        <p class="hint">在原时间线上选定最后完成的乘车或步行段、填写当前时刻，
+          可先在左侧修改站点、班次或停运信息，再从所在站搜索余程。
+          已完成的路段与候车记录原样保留。</p>
+        <div class="plan-grid">
+          <label>最后完成段
+            <select id="c-leg"></select>
+          </label>
+          <label>当前时刻
+            <input id="c-time" type="time" />
+          </label>
+          <label id="c-station-wrap" hidden>实际到达站（人在车上、班次中途终止时选择）
+            <select id="c-station"></select>
+          </label>
+        </div>
+        <button id="btn-continue" type="button" class="primary">发起续程</button>
+        <button id="btn-continue-reset" type="button" class="ghost">回到原规划结果</button>
+        <span id="continue-error" class="recalc-hint"></span>
+      </div>
     </section>
   </main>
 

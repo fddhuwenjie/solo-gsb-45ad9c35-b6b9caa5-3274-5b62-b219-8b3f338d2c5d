@@ -5,6 +5,8 @@
 const EMPTY_DATA = { stations: [], trips: [], transfers: [], suspensions: [] };
 let data = structuredClone(EMPTY_DATA);
 let lastResult = null;
+let lastItinerary = null;       // 最近一次成功规划/续程的时间线（供续程选择）
+let continuationMode = false;   // 当前结果是否为续程结果
 let stale = false;
 let qid = 0;
 
@@ -22,6 +24,12 @@ const els = {
   result: $("#result"),
   recalc: $("#recalc-hint"),
   fileImport: $("#file-import"),
+  continueCard: $("#continue-card"),
+  continueLeg: $("#c-leg"),
+  continueStationWrap: $("#c-station-wrap"),
+  continueStation: $("#c-station"),
+  continueTime: $("#c-time"),
+  continueError: $("#continue-error"),
 };
 
 const esc = (s) =>
@@ -347,6 +355,8 @@ async function runPlan() {
   }
   if (res.status === "error") return showError(res.message);
   lastResult = res;
+  lastItinerary = res.itinerary || null;
+  continuationMode = false;
   stale = false;
   els.recalc.hidden = true;
   renderResult(res);
@@ -361,20 +371,146 @@ function sname(sid) {
   return s ? `${s.id}·${s.name}` : sid;
 }
 
+function legTitle(l) {
+  if (l.type === "wait") return `候车 @ ${sname(l.station)}`;
+  if (l.type === "walk") return `步行 ${sname(l.from)}→${sname(l.to)}`;
+  return `乘坐 ${esc(l.route)}（${esc(l.trip_id)}）${sname(l.from)}→${sname(l.to)}`;
+}
+
+// ---------------------------------------------------------------- 续程
+function syncContinueLeg() {
+  const it = lastItinerary;
+  if (!it) return;
+  const cut = it.legs[Number(els.continueLeg.value)];
+  if (!cut) return;
+  // 乘车段若在原网络中对应多个经停站，提供“实际到达站”选择
+  if (cut.type === "ride") {
+    const trip = data.trips.find((t0) => t0.id === cut.trip_id);
+    const stops = (trip?.stops || []).filter(
+      (s) => cut.depart < timeToMinutes(s.time)
+        && timeToMinutes(s.time) < cut.arrive);
+    if (stops.length) {
+      els.continueStationWrap.hidden = false;
+      els.continueStation.innerHTML = stops
+        .map((s) => `<option value="${esc(s.station)}">${esc(sname(s.station))} · ${esc(s.time)}</option>`)
+        .join("");
+    } else {
+      els.continueStationWrap.hidden = true;
+      els.continueStation.value = "";
+    }
+  } else {
+    els.continueStationWrap.hidden = true;
+    els.continueStation.value = "";
+  }
+  els.continueTime.value = hhmm(cut.arrive);
+}
+
+const timeToMinutes = (v) => {
+  const [h, m] = String(v || "0:0").split(":").map(Number);
+  return h * 60 + m;
+};
+
+function renderContinuePanel() {
+  const it = lastItinerary;
+  if (!it || !Array.isArray(it.legs) ||
+      !it.legs.some((l) => l.type === "ride" || l.type === "walk")) {
+    els.continueCard.hidden = true;
+    return;
+  }
+  els.continueCard.hidden = false;
+  els.continueLeg.innerHTML = it.legs
+    .map((l, i) => (l.type === "ride" || l.type === "walk")
+      ? `<option value="${i}">第 ${i + 1} 段 · ${legTitle(l)}
+          · ${hhmm(l.depart)}–${hhmm(l.arrive)}</option>`
+      : "")
+    .join("");
+  // 默认选中最后一段乘车/步行
+  const lastMov = Math.max(...it.legs
+    .map((l, i) => (l.type === "ride" || l.type === "walk" ? i : -1)));
+  els.continueLeg.value = String(lastMov);
+  syncContinueLeg();
+  els.continueError.textContent = "";
+}
+
+async function runContinue() {
+  document.querySelectorAll(".row").forEach(readRow);
+  if (!lastItinerary) return;
+  const completedIndex = Number(els.continueLeg.value);
+  const cutLeg = lastItinerary.legs[completedIndex];
+  if (!cutLeg) return;
+  const currentTime = els.continueTime.value || hhmm(cutLeg.arrive);
+  const payload = {
+    itinerary: lastItinerary,
+    completed_index: completedIndex,
+    current_time: currentTime,
+    preference: els.preference.value,
+    data,
+  };
+  if (!els.continueStationWrap.hidden && els.continueStation.value) {
+    payload.completed_station = els.continueStation.value;
+  }
+
+  els.continueError.textContent = "";
+  els.result.innerHTML = `<p class="empty">续程搜索中…</p>`;
+  let res;
+  try {
+    const resp = await fetch("/api/continue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    res = await resp.json();
+  } catch (err) {
+    return showError(`请求失败：${err.message}`);
+  }
+  if (res.status === "error") {
+    els.continueError.textContent = res.message;
+    renderResult({ status: "ok", itinerary: lastItinerary });
+    return;
+  }
+  lastResult = res;
+  if (res.status === "ok") lastItinerary = res.itinerary;
+  continuationMode = true;
+  stale = false;
+  renderResult(res);
+}
+
+function resetContinuation() {
+  continuationMode = false;
+  if (lastResult) renderResult(lastResult);
+  renderContinuePanel();
+}
+
+$("#btn-continue").addEventListener("click", runContinue);
+$("#btn-continue-reset").addEventListener("click", resetContinuation);
+els.continueLeg.addEventListener("change", () => {
+  syncContinueLeg();
+});
+els.continueStation.addEventListener("change", () => {
+  const trip = data.trips.find(
+    (t0) => t0.id === lastItinerary?.legs[Number(els.continueLeg.value)]?.trip_id);
+  const st = trip?.stops.find((s) => s.station === els.continueStation.value);
+  if (st) els.continueTime.value = st.time;
+});
+
 function renderResult(res) {
-  if (res.status === "blocked") {
+  if (res.status === "blocked" && !res.itinerary) {
     const b = res.blocker;
     els.result.innerHTML = `
       <div class="blocked">
         <span class="badge">无可行行程 · 首个阻塞约束</span>
         <p>${esc(b.message)}</p>
       </div>`;
+    renderContinuePanel();
     return;
   }
   const it = res.itinerary;
+  const blocked = res.status === "blocked";
   const rideLegs = it.legs.filter((l) => l.type === "ride");
   const chips = [
-    `<span class="chip ok">到达 <strong>${hhmm(it.arrival)}</strong></span>`,
+    `<span class="chip ${blocked ? "" : "ok"}">${blocked
+      ? "余程阻塞"
+      : `到达 <strong>${hhmm(it.arrival)}</strong>`}</span>`,
     `<span class="chip">偏好：<strong>${esc(it.preference_label)}</strong></span>`,
     `<span class="chip">乘坐班次 <strong>${rideLegs.length}</strong></span>`,
     `<span class="chip">换乘 <strong>${it.transfers}</strong> 次</span>`,
@@ -382,28 +518,48 @@ function renderResult(res) {
     `<span class="chip">总等待 <strong>${it.waiting_minutes}</strong> 分钟</span>`,
   ].join("");
 
+  const contBanner = it.continued ? `
+    <div class="cont-banner">
+      🔁 续程：已完成至 <strong>${esc(sname(it.current_station))}</strong>
+      （当前时刻 ${hhmm(it.current_time)}），已完成路段原样保留；
+      <span class="legend"><i class="tag-done">已完成</i><i class="tag-todo">余程</i></span>
+    </div>` : "";
+
+  const blockedBox = blocked ? `
+    <div class="blocked cont-blocked">
+      <span class="badge">余程无可行方案 · 首个阻塞约束</span>
+      <p>${esc(res.blocker.message)}</p>
+      <p class="hint">以下为已完成部分，未走路段不标为完成。</p>
+    </div>` : "";
+
   const legsHtml = it.legs
     .map((l) => {
+      const doneCls = l.done ? " done" : " todo";
+      const tag = l.done
+        ? `<span class="seg-tag tag-done">已完成</span>`
+        : `<span class="seg-tag tag-todo">余程</span>`;
+      const interim = l.interim ? `<div class="meta">完成段至当前时刻的等待（已计入整程候车）</div>` : "";
       if (l.type === "wait") {
-        return `<li class="leg wait">
+        return `<li class="leg wait${doneCls}">
           <span class="dot">等</span>
           <div class="when">${hhmm(l.start)} – ${hhmm(l.end)}（${l.minutes} 分钟）</div>
-          <div class="what">站内候车</div>
+          <div class="what">站内候车 ${tag}</div>
           <div class="meta">在 ${esc(sname(l.station))} 等待下一班</div>
+          ${interim}
         </li>`;
       }
       if (l.type === "walk") {
-        return `<li class="leg walk">
+        return `<li class="leg walk${doneCls}">
           <span class="dot">走</span>
           <div class="when">${hhmm(l.depart)} – ${hhmm(l.arrive)}（${l.minutes} 分钟）</div>
-          <div class="what">步行换乘：${esc(sname(l.from))} → ${esc(sname(l.to))}</div>
+          <div class="what">步行换乘 ${tag}：${esc(sname(l.from))} → ${esc(sname(l.to))}</div>
           <div class="meta">步行 ${l.minutes} 分钟后于 ${hhmm(l.arrive)} 到达邻站方可乘车</div>
         </li>`;
       }
-      return `<li class="leg ride">
+      return `<li class="leg ride${doneCls}">
         <span class="dot">乘</span>
         <div class="when">${hhmm(l.depart)} 发车 · ${hhmm(l.arrive)} 到达（${l.minutes} 分钟）</div>
-        <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)}</div>
+        <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)} ${tag}</div>
         <div class="meta">${esc(sname(l.from))} 上车 → ${esc(sname(l.to))} 下车</div>
         ${l.truncated ? `<div class="meta trunc">⚠ ${esc(l.truncation)}</div>` : ""}
       </li>`;
@@ -411,12 +567,17 @@ function renderResult(res) {
     .join("");
 
   els.result.innerHTML = `
+    ${contBanner}
+    ${blockedBox}
     <div class="station-endpoint">
       ${esc(sname(it.origin))} → ${esc(sname(it.destination))}，
-      不早于 ${hhmm(it.earliest)} 出发
+      ${it.continued
+        ? `续程当前时刻 ${hhmm(it.current_time)}（原最早出发 ${hhmm(it.earliest)}）`
+        : `不早于 ${hhmm(it.earliest)} 出发`}
     </div>
     <div class="summary">${chips}</div>
     <ul class="timeline">${legsHtml}</ul>`;
+  renderContinuePanel();
 }
 
 // ---------------------------------------------------------------- 工具按钮
@@ -424,20 +585,26 @@ async function loadSample() {
   const resp = await fetch("/api/sample");
   data = await resp.json();
   lastResult = null;
+  lastItinerary = null;
+  continuationMode = false;
   renderAll();
   els.earliest.value = "08:00";
   els.preference.value = "fastest";
   els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运），点击「规划行程」。</p>`;
   els.recalc.hidden = true;
+  renderContinuePanel();
 }
 
 function clearAll() {
   if (!confirm("确定清空全部站点、班次、换乘与停运记录？")) return;
   data = structuredClone(EMPTY_DATA);
   lastResult = null;
+  lastItinerary = null;
+  continuationMode = false;
   renderAll();
   els.result.innerHTML = `<p class="empty">录入站点与班次后点击「规划行程」。</p>`;
   els.recalc.hidden = true;
+  renderContinuePanel();
 }
 
 function exportJson() {
@@ -465,6 +632,8 @@ els.fileImport.addEventListener("change", async (ev) => {
     };
     renderAll();
     markStale();
+    continuationMode = false;
+    renderContinuePanel();
   } catch (err) {
     showError(`导入失败：${err.message}`);
   }

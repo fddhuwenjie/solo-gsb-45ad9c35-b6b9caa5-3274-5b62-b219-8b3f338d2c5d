@@ -49,6 +49,30 @@ python app.py
 **修改任何输入后可再次点击直接重算**，页面会提示“结果待重算”。
 工具栏支持载入示例、清空、导入 / 导出 JSON。
 
+### 途中停运 / 班次调整后的续程
+
+行程途中发生临时停运或班次调整时，在「⑦ 途中停运 / 班次调整后续程」中：
+
+1. **选定最后完成段**：在原规划时间线的乘车段、步行段中选择实际走完的最后一段；
+   若人在车上、班次在中途某站终止（例如区段停运被截断），再选择
+   **实际到达站**（必须是该班次该乘车段内的中途经停站）；
+2. **填写当前时刻**：不得早于完成段的最后到达时刻；
+3. 先在左侧四块录入区**修改站点、班次、步行换乘或停运信息**（更新后的网络），
+   点击 **发起续程**。
+
+系统核对完成部分的站点与时间连续性后，从所在站与当前时刻在**更新后的网络**上
+搜索余程：
+
+- 已完成的乘车段、步行段与候车记录**原样沿用原时间线**，不会因新停运被抹掉，
+  完成段至当前时刻的等待（`interim` 候车段）计入整程候车；
+- 整程的换乘、步行、候车为**完成部分 + 余程的累计值**；同一车辆在下车的
+  同一站继续向前不算新增换乘；
+- 步行绕行后重乘同一班次，只能在更靠后的经停站上车，**不得回到已乘过的站段**；
+- 余程无解时仍返回并展示**已完成部分**与首个阻塞原因，未走路段一律不标为完成
+  （`arrival` 为 `null`，`status` 为 `blocked`）。
+
+时间线上已完成段标 **已完成**（变暗）、余程段标 **余程**。
+
 ### 偏好与字典序取解
 
 | 偏好 | 字典序（从主到次） |
@@ -82,6 +106,7 @@ python app.py
 - `GET /` — 页面
 - `GET /api/sample` — 内置示例数据
 - `POST /api/plan` — 规划
+- `POST /api/continue` — 途中停运 / 班次调整后续程
 
 `/api/plan` 请求体：
 
@@ -116,6 +141,106 @@ python app.py
 成功返回 `{"status": "ok", "itinerary": {...}}`，
 无解返回 `{"status": "blocked", "blocker": {"message": "首个阻塞约束…"}}`，
 输入不合法返回 HTTP 400 与 `{"status": "error", "message": "..."}`。
+
+### 续程接口 `POST /api/continue`
+
+请求体：
+
+| 字段 | 说明 |
+|---|---|
+| `itinerary` | `/api/plan`（或上一次续程）返回的完整 `itinerary` 对象 |
+| `completed_index` | 原时间线 `legs` 中最后完成段的下标，必须是 `ride` / `walk` 段 |
+| `current_time` | 当前时刻 `HH:MM`，**不得早于**完成段最后到达时刻 |
+| `data` | **更新后的网络**（站点、班次、步行换乘、停运；格式同 `/api/plan`） |
+| `completed_station` | 可选。人在车上、班次在中途某站终止时，填写该乘车段内的**实际到达中途站** |
+| `preference` | 可选，缺省沿用原行程的偏好 |
+
+返回体在 itinerary 基础上额外给出：
+
+- 每段的 `done` 标记（完成段为 `true`，余程段缺省 / `false`）；
+- 完成段至当前时刻的候车段带 `"interim": true`；
+- `itinerary.continued = true`、`current_station`、`current_time`；
+- 余程无解时 `status = "blocked"`、`arrival = null`，并附 `blocker`
+  与只含完成部分的 `itinerary.legs`，另有 `continuation`
+  （`current_station` / `current_time` / `last_arrival`）。
+
+调用示例（原行程 A→E 乘 T1，途中 T1 在 B 被区段停运截断，08:10 到达 B；
+随后步行绕行到 D，重乘同一班次 T1 的 D→E）：
+
+```bash
+curl -X POST http://localhost:8000/api/continue \
+  -H "Content-Type: application/json" \
+  -d '{
+    "itinerary": {
+      "origin": "A", "destination": "E", "earliest": "07:00",
+      "preference": "fastest",
+      "legs": [
+        {"type": "wait", "station": "A", "start": "07:00",
+         "end": "08:00", "minutes": 60},
+        {"type": "ride", "trip_id": "T1", "route": "1路",
+         "from": "A", "to": "E", "depart": "08:00",
+         "arrive": "08:40", "minutes": 40}
+      ]
+    },
+    "completed_index": 1,
+    "completed_station": "B",
+    "current_time": "08:10",
+    "data": {
+      "stations": [{"id": "A"}, {"id": "B"}, {"id": "C"},
+                   {"id": "D"}, {"id": "E"}],
+      "trips": [{"id": "T1", "route": "1路", "stops": [
+                   {"station": "A", "time": "08:00"},
+                   {"station": "B", "time": "08:10"},
+                   {"station": "C", "time": "08:20"},
+                   {"station": "D", "time": "08:30"},
+                   {"station": "E", "time": "08:40"}]}],
+      "transfers": [{"from": "B", "to": "D", "minutes": 15}],
+      "suspensions": [{"kind": "segment", "route": "1路",
+                       "from": "B", "to": "D",
+                       "start": "00:00", "end": "23:59",
+                       "label": "区间施工"}]
+    }
+  }'
+```
+
+响应（节选；时间均为分钟数）：完成段 T1 被截到 B 并标 `done`，余程为
+步行 B→D（15 分钟）后重乘 T1 的 D→E，且不会回到已乘过的 B→C、C→D 站段：
+
+```json
+{"status": "ok",
+ "continuation": {"current_station": "B", "current_time": 490,
+                  "last_arrival": 490, "completed_index": 1},
+ "itinerary": {"continued": true, "arrival": 520,
+   "rides": 2, "transfers": 1, "walking_minutes": 15,
+   "waiting_minutes": 65,
+   "legs": [
+     {"type": "wait", "station": "A", "start": 420, "end": 480,
+      "minutes": 60, "done": true},
+     {"type": "ride", "trip_id": "T1", "route": "1路",
+      "from": "A", "to": "B", "depart": 480, "arrive": 490,
+      "minutes": 10, "done": true, "truncated": true},
+     {"type": "walk", "from": "B", "to": "D", "depart": 490,
+      "arrive": 505, "minutes": 15},
+     {"type": "wait", "station": "D", "start": 505, "end": 510,
+      "minutes": 5},
+     {"type": "ride", "trip_id": "T1", "route": "1路",
+      "from": "D", "to": "E", "depart": 510, "arrive": 520,
+      "minutes": 10}
+   ]}}
+```
+
+若余程无解（例如删去上例的步行换乘），返回：
+
+```json
+{"status": "blocked",
+ "blocker": {"kind": "segment_suspended", "trip_id": "T1",
+   "seg_from": "B", "seg_to": "C",
+   "message": "班次 T1（1路）…站段被线路区段停运封锁…"},
+ "continuation": {"current_station": "B", "current_time": 490,
+                  "last_arrival": 490, "completed_index": 1},
+ "itinerary": {"arrival": null, "continued": true,
+   "legs": [ /* 仅完成部分：候车段与 T1 A→B，均带 done:true */ ]}}
+```
 
 ### 调用示例
 
@@ -182,6 +307,8 @@ curl -X POST http://localhost:8000/api/plan \
 │   ├── style.css        # 样式
 │   └── app.js           # 原生 JS：录入、重算、结果渲染
 ├── requirements.txt
+├── test_segment.py       # 区段停运行为验证
+├── test_continue.py      # 续程行为验证（完成段沿用、续程搜索、阻塞展示）
 ├── Dockerfile
 └── docker-compose.yml
 ```

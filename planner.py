@@ -430,6 +430,26 @@ class Planner:
             return {"status": "ok", "itinerary": self._itinerary(
                 origin, destination, earliest, preference, (), 0)}
 
+        found = self._search(origin, destination, earliest, preference)
+        if found["status"] != "ok":
+            return found
+        return {"status": "ok", "explored": found["explored"],
+                "itinerary": self._itinerary(
+                    origin, destination, earliest, preference,
+                    found["chain"], found["rides"], found["walk"],
+                    found["arrival"])}
+
+    # ------------------------------------------------------------------ #
+    def _search(self, origin: str, destination: str, earliest: int,
+                preference: str, init_rides: int = 0,
+                init_walk: int = 0,
+                ridden_max: dict[str, int] | None = None) -> dict:
+        """从 (origin, earliest) 出发到 destination 的多标签时间依赖搜索。
+
+        init_rides / init_walk 为续程前已累计的乘车段数与步行分钟；
+        ridden_max 记录每个班次此前已乘到的最远经停下标，绕行后重乘同一
+        班次时不得回到已乘过的站段。
+        """
         blockers: dict[tuple, dict] = {}
 
         def record(blocker: dict) -> None:
@@ -455,11 +475,11 @@ class Planner:
         def key_tuple(label: dict) -> tuple:
             return tuple(vec(label))
 
-        # 标签：站点、到达时刻、乘坐班次数、累计步行分钟、上次班次及其下车下标、链
+        # 标签：站点、到达时刻、乘坐班次数、累计步行分钟、各班次已乘最远下标、链
         start_label = {
             "uid": 0, "station": origin, "arrival": earliest,
-            "rides": 0, "walk": 0, "last_trip": None, "last_alight": -1,
-            "chain": (),
+            "rides": init_rides, "walk": init_walk,
+            "ridden": dict(ridden_max or {}), "chain": (),
         }
         buckets: dict[str, list[dict]] = {s: [] for s in self.n["stations"]}
         buckets[origin].append(start_label)
@@ -471,12 +491,10 @@ class Planner:
         explored = 0
 
         def try_extend(label: dict, station: str, arrival: int, rides: int,
-                       walk: int, last_trip: str | None, last_alight: int,
-                       step: dict) -> None:
+                       walk: int, ridden: dict, step: dict) -> None:
             new_label = {
                 "uid": next(counter), "station": station, "arrival": arrival,
-                "rides": rides, "walk": walk, "last_trip": last_trip,
-                "last_alight": last_alight,
+                "rides": rides, "walk": walk, "ridden": ridden,
                 "chain": label["chain"] + (step,),
             }
             bucket = buckets[station]
@@ -517,8 +535,7 @@ class Planner:
                     })
                     continue
                 try_extend(label, neighbor, arrival, label["rides"],
-                           label["walk"] + minutes, label["last_trip"],
-                           label["last_alight"],
+                           label["walk"] + minutes, dict(label["ridden"]),
                            {"type": "walk", "from": station, "to": neighbor,
                             "depart": ready, "arrive": arrival,
                             "minutes": minutes})
@@ -529,10 +546,10 @@ class Planner:
                 dep = trip["stops"][idx]["time"]
                 if dep < ready:
                     continue  # 已发车
-                if (trip_id == label["last_trip"]
-                        and idx <= label["last_alight"]):
-                    continue  # 同班次已乘过的区段不重复乘坐；但因区段停运
-                    # 提前下车、步行绕行后，仍可在更靠后的经停站重新上车
+                if idx < label["ridden"].get(trip_id, -1):
+                    continue  # 上车点落在已乘过的站段内会回到已乘路段；
+                    # 在下车的同一站继续向前（车辆未变）或步行绕行到更靠后
+                    # 的经停站重新上车，均不受此限
 
                 # 本站上车时站点必须开放
                 open_board, win_board = self.station_open(station, dep)
@@ -614,9 +631,15 @@ class Planner:
                             ),
                         })
                         continue
+                    new_ridden = dict(label["ridden"])
+                    new_ridden[trip_id] = max(j, new_ridden.get(trip_id, -1))
+                    # 在下车的同一站、同一时刻继续乘同一车辆向前不算新的乘坐
+                    new_board = 0 if idx == label["ridden"].get(
+                        trip_id, -2) else 1
                     try_extend(
-                        label, target, arrive_at, label["rides"] + 1,
-                        label["walk"], trip_id, j,
+                        label, target, arrive_at,
+                        label["rides"] + new_board,
+                        label["walk"], new_ridden,
                         {"type": "ride", "trip_id": trip_id,
                          "route": trip["route"], "from": station,
                          "to": target, "depart": dep, "arrive": arrive_at,
@@ -633,11 +656,258 @@ class Planner:
                     "transfers": max(0, lb["rides"] - 1),
                     "walking": lb["walk"]}[f] for f in order]),
             lb["uid"]))
-        return {"status": "ok", "explored": explored,
-                "itinerary": self._itinerary(origin, destination, earliest,
-                                             preference, best["chain"],
-                                             best["rides"], best["walk"],
-                                             best["arrival"])}
+        return {"status": "ok", "explored": explored, "chain": best["chain"],
+                "rides": best["rides"], "walk": best["walk"],
+                "arrival": best["arrival"]}
+
+    # ------------------------------------------------------------------ #
+    def continue_trip(self, itinerary: dict, completed_index: int,
+                      current_time: int, preference: str | None = None,
+                      completed_station: str | None = None) -> dict:
+        """在原时间线上选定最后完成的乘车/步行段，从 (所在站, 当前时刻) 续程。
+
+        已完成的路段与候车记录原样沿用（不因新网络的停运而抹掉），仅对未走
+        余程在更新后的网络上重新搜索；当前时刻不得早于完成段的最后到达时刻。
+        completed_station 用于“人在车上、班次在中途某站终止”的情形：完成段
+        是原时间线上更长的乘车段时，以该班次实际到达的中途经停站为准。
+        """
+        if not isinstance(itinerary, dict):
+            raise PlanError("缺少原行程 itinerary")
+        raw_legs = itinerary.get("legs")
+        if not isinstance(raw_legs, list) or not raw_legs:
+            raise PlanError("原行程时间线为空，无法续程；请先规划行程")
+        origin = str(itinerary.get("origin", "")).strip()
+        destination = str(itinerary.get("destination", "")).strip()
+        if not origin or not destination:
+            raise PlanError("原行程缺少起点或终点站")
+        if preference is None:
+            preference = str(itinerary.get("preference", "fastest")).strip()
+        if preference not in PREFERENCE_FIELDS:
+            raise PlanError(f"未知偏好：{preference}")
+        try:
+            earliest = int(itinerary["earliest"])
+        except (KeyError, TypeError, ValueError):
+            raise PlanError("原行程缺少最早出发时刻")
+        if not 0 <= earliest < DAY_MINUTES:
+            raise PlanError("原行程最早出发时刻超出当日范围")
+        if not 0 <= current_time < DAY_MINUTES:
+            raise PlanError("当前时刻超出当日范围")
+        if isinstance(completed_index, bool) or not isinstance(
+                completed_index, int):
+            raise PlanError("完成段序号必须为整数")
+        if not 0 <= completed_index < len(raw_legs):
+            raise PlanError(
+                f"完成段序号超出时间线范围：{completed_index}")
+        cut_leg = raw_legs[completed_index]
+        if not isinstance(cut_leg, dict) or cut_leg.get("type") not in (
+                "ride", "walk"):
+            raise PlanError("只能选定已完成的乘车段或步行段作为续程起点")
+
+        # ---- 核对完成部分的站点与时间连续性 ----
+        prefix: list[dict] = []
+        cursor_station = origin
+        cursor_time = earliest
+        prefix_rides = 0
+        prefix_walk = 0
+        prefix_wait = 0
+        for i, leg in enumerate(raw_legs[:completed_index + 1]):
+            if not isinstance(leg, dict):
+                raise PlanError(f"原时间线第 {i + 1} 段格式不合法")
+            kind = leg.get("type")
+            try:
+                depart = int(leg.get("depart", leg.get("start")))
+                arrive = int(leg.get("arrive", leg.get("end")))
+            except (TypeError, ValueError):
+                raise PlanError(f"原时间线第 {i + 1} 段时刻不合法")
+            if not (0 <= depart <= arrive < DAY_MINUTES):
+                raise PlanError(f"原时间线第 {i + 1} 段时刻超出当日范围")
+            if kind == "wait":
+                station = str(leg.get("station", "")).strip()
+                if station != cursor_station:
+                    raise PlanError(
+                        f"原时间线第 {i + 1} 段候车站点与前序到站不一致："
+                        f"{station} ≠ {cursor_station}")
+                if depart != cursor_time or arrive < depart:
+                    raise PlanError(
+                        f"原时间线第 {i + 1} 段候车时间与前序不连续")
+                prefix_wait += arrive - depart
+                cursor_time = arrive
+                done_leg = dict(leg)
+            elif kind in ("ride", "walk"):
+                frm = str(leg.get("from", "")).strip()
+                to = str(leg.get("to", "")).strip()
+                if frm != cursor_station:
+                    raise PlanError(
+                        f"原时间线第 {i + 1} 段起点站与前序到站不一致："
+                        f"{frm} ≠ {cursor_station}")
+                if depart < cursor_time:
+                    raise PlanError(
+                        f"原时间线第 {i + 1} 段出发时刻早于前序到达时刻，"
+                        "时间不连续")
+                done_leg = dict(leg)
+                # 末段（完成段）可能实际只走到中途某站（例如人在车上、
+                # 班次在该站被区段停运截断）：以 completed_station 为准
+                if i == completed_index and completed_station:
+                    cs = str(completed_station).strip()
+                    if kind == "ride":
+                        trip0 = self.n["trips"].get(
+                            str(leg.get("trip_id", "")).strip())
+                        mid = None
+                        if trip0 is not None and cs != frm:
+                            mid = next(
+                                (st for st in trip0["stops"]
+                                 if st["station"] == cs
+                                 and depart < st["time"] < arrive), None)
+                        if mid is None:
+                            raise PlanError(
+                                f"实际到达站 {cs} 不是班次 "
+                                f"{leg.get('trip_id')} 在该乘车段内的经停站")
+                        to = cs
+                        arrive = mid["time"]
+                    elif cs != to:
+                        raise PlanError(
+                            "步行段的实际到达站只能是该步行段的终点站")
+                    done_leg["to"] = to
+                    done_leg["arrive"] = arrive
+                    done_leg["minutes"] = max(0, arrive - depart)
+                    done_leg["truncated"] = True
+                    done_leg.pop("truncation", None)
+                    note = self._truncation_note(done_leg)
+                    if note:
+                        done_leg["truncation"] = note
+                if kind == "ride":
+                    prefix_rides += 1
+                else:
+                    prefix_walk += max(0, arrive - depart)
+                cursor_station = to
+                cursor_time = arrive
+            else:
+                raise PlanError(f"原时间线第 {i + 1} 段类型不合法：{kind}")
+            done_leg["done"] = True
+            prefix.append(done_leg)
+
+        last_arrival = cursor_time
+        current_station = cursor_station
+        if current_time < last_arrival:
+            raise PlanError(
+                f"当前时刻 {to_hhmm(current_time)} 早于最后到达时刻 "
+                f"{to_hhmm(last_arrival)}，不能发起续程")
+
+        # 更新后的网络必须仍含有所在站与终点站
+        if current_station not in self.names:
+            raise PlanError(
+                f"所在站 {current_station} 在更新后的网络中不存在，"
+                "请先在站点表中补回或修改完成段")
+        if destination not in self.names:
+            raise PlanError(f"终点站 {destination} 在更新后的网络中不存在")
+
+        # 已乘班次数组：班次 -> 在该班次已乘到的最远经停下标（按新网络对齐）
+        ridden_max: dict[str, int] = {}
+        for leg in prefix:
+            if leg["type"] != "ride":
+                continue
+            trip = self.n["trips"].get(leg["trip_id"])
+            if not trip:
+                continue  # 班次已从新网络删除：沿用事实，但无法再乘该班
+            stops = trip["stops"]
+            alight_idx = next(
+                (k for k, st in enumerate(stops)
+                 if st["station"] == leg["to"] and st["time"] == leg["arrive"]),
+                None)
+            if alight_idx is None:
+                alight_idx = next(
+                    (k for k, st in enumerate(stops)
+                     if st["station"] == leg["to"]), None)
+            if alight_idx is not None:
+                ridden_max[leg["trip_id"]] = max(
+                    alight_idx, ridden_max.get(leg["trip_id"], -1))
+
+        # 完成段至当前时刻的等待（已经历，沿用并计入整程候车）
+        gap = current_time - last_arrival
+        if gap > 0:
+            prefix.append({"type": "wait", "station": current_station,
+                           "start": last_arrival, "end": current_time,
+                           "minutes": gap, "done": True, "interim": True})
+        prefix_wait += gap
+
+        continuation = {
+            "current_station": current_station,
+            "current_time": current_time,
+            "completed_index": completed_index,
+            "last_arrival": last_arrival,
+        }
+
+        if current_station == destination:
+            found = {"status": "ok", "chain": (), "rides": prefix_rides,
+                     "walk": prefix_walk, "arrival": current_time,
+                     "explored": 0}
+        else:
+            found = self._search(current_station, destination, current_time,
+                                 preference, prefix_rides, prefix_walk,
+                                 ridden_max)
+
+        if found["status"] != "ok":
+            found["itinerary"] = self._continuation_itinerary(
+                itinerary, preference, prefix, prefix_rides, prefix_walk,
+                prefix_wait, current_station, current_time, destination,
+                None)
+            found["continuation"] = continuation
+            return found
+
+        remainder_legs = self._chain_legs(found["chain"], done=False)
+        final_legs = prefix + remainder_legs
+        rem_wait = sum(l["minutes"] for l in remainder_legs
+                       if l["type"] == "wait")
+        result_itinerary = self._continuation_itinerary(
+            itinerary, preference, final_legs, found["rides"],
+            found["walk"], prefix_wait + rem_wait, current_station,
+            current_time, destination, found["arrival"])
+        return {"status": "ok", "explored": found["explored"],
+                "continuation": continuation, "itinerary": result_itinerary}
+
+    # ------------------------------------------------------------------ #
+    def _chain_legs(self, chain: tuple, done: bool) -> list[dict]:
+        """把搜索链转为带候车段的时间线片段（续程余程用）。"""
+        legs: list[dict] = []
+        cursor: int | None = None
+        for step in chain:
+            if cursor is not None and step["depart"] > cursor:
+                legs.append({"type": "wait", "station": step["from"],
+                             "start": cursor, "end": step["depart"],
+                             "minutes": step["depart"] - cursor,
+                             "done": done})
+            leg = dict(step)
+            leg["done"] = done
+            if leg["type"] == "ride":
+                note = self._truncation_note(leg)
+                if note:
+                    leg["truncated"] = True
+                    leg["truncation"] = note
+            legs.append(leg)
+            cursor = step["arrive"]
+        return legs
+
+    def _continuation_itinerary(self, original: dict, preference: str,
+                                legs: list[dict], rides: int, walk: int,
+                                waiting: int, current_station: str,
+                                current_time: int, destination: str,
+                                arrival: int | None) -> dict:
+        return {
+            "origin": str(original.get("origin", "")).strip(),
+            "destination": destination,
+            "earliest": int(original["earliest"]),
+            "preference": preference,
+            "preference_label": PREFERENCE_LABELS[preference],
+            "continued": True,
+            "current_station": current_station,
+            "current_time": current_time,
+            "arrival": arrival,
+            "rides": rides,
+            "transfers": max(0, rides - 1),
+            "walking_minutes": walk,
+            "waiting_minutes": waiting,
+            "legs": legs,
+        }
 
     # ------------------------------------------------------------------ #
     def _first_blocker(self, blockers: dict, origin: str,
