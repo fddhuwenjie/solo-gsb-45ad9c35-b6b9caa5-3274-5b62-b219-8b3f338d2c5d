@@ -93,6 +93,30 @@
         <div id="result">
           <p class="empty">录入站点与班次后点击「规划行程」。</p>
         </div>
+        <div id="continue-panel" class="continue-panel" hidden>
+          <h3>⑦ 行程续程（途中停运 / 班次调整后接续）</h3>
+          <p class="hint" id="continue-hint">
+            在下方时间线中选定最后完成的乘车或步行段、填写当前时刻，
+            并先在左侧修改站点 / 班次 / 停运信息，再发起续程。
+          </p>
+          <div class="continue-grid">
+            <label>最后完成段
+              <select id="ct-leg"></select>
+            </label>
+            <label>当前时刻
+              <input id="ct-time" type="time" />
+            </label>
+            <label>余程偏好
+              <select id="ct-preference">
+                <option value="fastest">最快到达</option>
+                <option value="transfers">最少换乘</option>
+                <option value="walking">最少步行</option>
+              </select>
+            </label>
+            <button id="btn-continue" type="button" class="primary">发起续程</button>
+          </div>
+          <span id="continue-error" class="continue-error" hidden></span>
+        </div>
       </div>
     </section>
   </main>

@@ -56,5 +56,36 @@ def plan():
     return jsonify(result)
 
 
+@app.post("/api/continue")
+def continue_trip():
+    """途中停运 / 班次调整后的行程续程。"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error",
+                        "message": "请求体必须是 JSON 对象"}), 400
+
+    original = payload.get("itinerary") or payload.get("original")
+    data = payload.get("data") or {}
+    cont = payload.get("continue") or {}
+
+    try:
+        network = normalize(data)
+        completed_index = cont.get("completed_index")
+        if isinstance(completed_index, str) and completed_index.strip().isdigit():
+            completed_index = int(completed_index.strip())
+        current_time = parse_time(cont.get("current_time", cont.get("now")),
+                                  "当前时刻")
+        destination = cont.get("destination")
+        if destination is not None:
+            destination = str(destination).strip() or None
+        preference = str(cont.get("preference", "fastest")).strip()
+        result = Planner(network).continue_trip(
+            original, destination, completed_index, current_time, preference)
+    except PlanError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

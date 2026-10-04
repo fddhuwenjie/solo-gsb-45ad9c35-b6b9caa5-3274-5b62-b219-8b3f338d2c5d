@@ -7,6 +7,7 @@ let data = structuredClone(EMPTY_DATA);
 let lastResult = null;
 let stale = false;
 let qid = 0;
+let continueReq = null; // 续程时回显的原 itinerary（来自最近一次规划/续程结果）
 
 const $ = (sel) => document.querySelector(sel);
 const els = {
@@ -22,6 +23,12 @@ const els = {
   result: $("#result"),
   recalc: $("#recalc-hint"),
   fileImport: $("#file-import"),
+  continuePanel: $("#continue-panel"),
+  continueLeg: $("#ct-leg"),
+  continueTime: $("#ct-time"),
+  continuePref: $("#ct-preference"),
+  continueError: $("#continue-error"),
+  btnContinue: $("#btn-continue"),
 };
 
 const esc = (s) =>
@@ -349,74 +356,198 @@ async function runPlan() {
   lastResult = res;
   stale = false;
   els.recalc.hidden = true;
+  continueReq = null;
   renderResult(res);
 }
 
 function showError(message) {
   els.result.innerHTML = `<p class="error-banner">⚠ ${esc(message)}</p>`;
+  els.continuePanel.hidden = true;
 }
+
+// ---------------------------------------------------------------- 行程续程
+async function runContinue() {
+  if (!lastResult || !lastResult.itinerary || !lastResult.itinerary.legs) return;
+  document.querySelectorAll(".row").forEach(readRow);
+
+  const original = continueReq || lastResult.itinerary;
+  const completedIndex = Number(els.continueLeg.value);
+  const body = {
+    data,
+    itinerary: original,
+    continue: {
+      completed_index: completedIndex,
+      current_time: els.continueTime.value || "",
+      preference: els.continuePref.value,
+    },
+  };
+  els.continueError.hidden = true;
+  let res;
+  try {
+    const resp = await fetch("/api/continue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    res = await resp.json();
+  } catch (err) {
+    return showContinueError(`请求失败：${err.message}`);
+  }
+  if (res.status === "error") return showContinueError(res.message);
+  // 续程结果成为新的当前结果；再次续程时以它为原时间线（已完成段被锁定）
+  lastResult = res;
+  continueReq = res.itinerary;
+  stale = false;
+  els.recalc.hidden = true;
+  renderResult(res);
+}
+
+function showContinueError(message) {
+  els.continueError.textContent = `⚠ ${message}`;
+  els.continueError.hidden = false;
+}
+
+els.continueLeg.addEventListener("change", () => {
+  const it = (continueReq || (lastResult && lastResult.itinerary));
+  const leg = it && it.legs[Number(els.continueLeg.value)];
+  if (leg) els.continueTime.value = hhmm(leg.arrive);
+  els.continueError.hidden = true;
+});
+els.btnContinue.addEventListener("click", runContinue);
 
 function sname(sid) {
   const s = data.stations.find((x) => x.id === sid);
   return s ? `${s.id}·${s.name}` : sid;
 }
 
-function renderResult(res) {
-  if (res.status === "blocked") {
-    const b = res.blocker;
-    els.result.innerHTML = `
-      <div class="blocked">
-        <span class="badge">无可行行程 · 首个阻塞约束</span>
-        <p>${esc(b.message)}</p>
-      </div>`;
+function legText(l) {
+  if (l.type === "wait") return `候车 @${sname(l.station)} ${hhmm(l.start)}–${hhmm(l.end)}`;
+  if (l.type === "walk") return `步行 ${sname(l.from)}→${sname(l.to)} ${hhmm(l.depart)}–${hhmm(l.arrive)}`;
+  return `乘 ${esc(l.route)}/${esc(l.trip_id)} ${sname(l.from)}→${sname(l.to)} ${hhmm(l.depart)}–${hhmm(l.arrive)}`;
+}
+
+function populateContinuePanel(it) {
+  // 仅已实际产生的乘车 / 步行段可选为“最后完成段”；候车段不可选。
+  const opts = it.legs
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => l.type === "ride" || l.type === "walk")
+    .map(({ l, i }) => `<option value="${i}">#${i + 1} ${legText(l)}</option>`)
+    .join("");
+  els.continueLeg.innerHTML = opts;
+  els.continueError.hidden = true;
+  if (!opts) {
+    els.continuePanel.hidden = true;
     return;
   }
+  els.continuePanel.hidden = false;
+  // 默认选最后一个乘车 / 步行段，并把当前时刻预置为该段到达时刻
+  const pickable = it.legs
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => l.type === "ride" || l.type === "walk");
+  const last = pickable[pickable.length - 1];
+  els.continueLeg.value = String(last.i);
+  els.continueTime.value = hhmm(last.l.arrive);
+  els.continuePref.value = it.preference || "fastest";
+}
+
+function renderResult(res) {
   const it = res.itinerary;
-  const rideLegs = it.legs.filter((l) => l.type === "ride");
-  const chips = [
-    `<span class="chip ok">到达 <strong>${hhmm(it.arrival)}</strong></span>`,
-    `<span class="chip">偏好：<strong>${esc(it.preference_label)}</strong></span>`,
-    `<span class="chip">乘坐班次 <strong>${rideLegs.length}</strong></span>`,
-    `<span class="chip">换乘 <strong>${it.transfers}</strong> 次</span>`,
-    `<span class="chip">总步行 <strong>${it.walking_minutes}</strong> 分钟</span>`,
-    `<span class="chip">总等待 <strong>${it.waiting_minutes}</strong> 分钟</span>`,
-  ].join("");
+  const completedCount = it && it.continuation ? it.completed_count ?? 0 : 0;
+
+  if (res.status === "blocked") {
+    const b = res.blocker;
+    let timelineHtml = "";
+    if (it && it.legs) {
+      // 续程无解：仍展示完成部分（含等待至当前时刻）与余程阻塞原因
+      const legs = it.legs.map((l, idx) => renderLegLi(l, idx, completedCount)).join("");
+      timelineHtml = `
+        <div class="station-endpoint">
+          ${esc(sname(it.resume_station || it.origin))} 之后的余程无可行接续
+          （目标 ${esc(sname(it.destination))}，当前时刻 ${hhmm(it.resume_time)}）
+        </div>
+        ${renderSummaryChips(it, true)}
+        <ul class="timeline">${legs}</ul>`;
+    }
+    els.result.innerHTML = `
+      <div class="blocked">
+        <span class="badge">${it && it.continuation ? "余程无可行接续 · 首个阻塞约束" : "无可行行程 · 首个阻塞约束"}</span>
+        <p>${esc(b.message)}</p>
+      </div>
+      ${timelineHtml}`;
+    if (it && it.continuation) populateContinuePanel(it);
+    else els.continuePanel.hidden = true;
+    return;
+  }
 
   const legsHtml = it.legs
-    .map((l) => {
-      if (l.type === "wait") {
-        return `<li class="leg wait">
-          <span class="dot">等</span>
-          <div class="when">${hhmm(l.start)} – ${hhmm(l.end)}（${l.minutes} 分钟）</div>
-          <div class="what">站内候车</div>
-          <div class="meta">在 ${esc(sname(l.station))} 等待下一班</div>
-        </li>`;
-      }
-      if (l.type === "walk") {
-        return `<li class="leg walk">
-          <span class="dot">走</span>
-          <div class="when">${hhmm(l.depart)} – ${hhmm(l.arrive)}（${l.minutes} 分钟）</div>
-          <div class="what">步行换乘：${esc(sname(l.from))} → ${esc(sname(l.to))}</div>
-          <div class="meta">步行 ${l.minutes} 分钟后于 ${hhmm(l.arrive)} 到达邻站方可乘车</div>
-        </li>`;
-      }
-      return `<li class="leg ride">
-        <span class="dot">乘</span>
-        <div class="when">${hhmm(l.depart)} 发车 · ${hhmm(l.arrive)} 到达（${l.minutes} 分钟）</div>
-        <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)}</div>
-        <div class="meta">${esc(sname(l.from))} 上车 → ${esc(sname(l.to))} 下车</div>
-        ${l.truncated ? `<div class="meta trunc">⚠ ${esc(l.truncation)}</div>` : ""}
-      </li>`;
-    })
+    .map((l, idx) => renderLegLi(l, idx, completedCount))
     .join("");
 
   els.result.innerHTML = `
     <div class="station-endpoint">
       ${esc(sname(it.origin))} → ${esc(sname(it.destination))}，
-      不早于 ${hhmm(it.earliest)} 出发
+      ${it.continuation
+        ? `自 ${esc(sname(it.resume_station))} 于 ${hhmm(it.resume_time)} 续程`
+        : `不早于 ${hhmm(it.earliest)} 出发`}
     </div>
-    <div class="summary">${chips}</div>
+    ${renderSummaryChips(it, false)}
     <ul class="timeline">${legsHtml}</ul>`;
+  populateContinuePanel(it);
+}
+
+function renderSummaryChips(it, blocked) {
+  const rideLegs = it.legs.filter((l) => l.type === "ride");
+  const chips = [
+    `<span class="chip ${blocked ? "" : "ok"}">${blocked ? "余程阻塞" : "到达"} <strong>${blocked ? "--:--" : hhmm(it.arrival)}</strong></span>`,
+    `<span class="chip">偏好：<strong>${esc(it.preference_label)}</strong></span>`,
+    `<span class="chip">乘坐班次 <strong>${rideLegs.length}</strong></span>`,
+    `<span class="chip">换乘 <strong>${it.transfers}</strong> 次</span>`,
+    `<span class="chip">总步行 <strong>${it.walking_minutes}</strong> 分钟</span>`,
+    `<span class="chip">总等待 <strong>${it.waiting_minutes}</strong> 分钟</span>`,
+  ];
+  if (it.continuation)
+    chips.push(`<span class="chip cont">续程 · 已完成 <strong>${it.completed_count}</strong> 段</span>`);
+  return `<div class="summary">${chips.join("")}</div>`;
+}
+
+function renderLegLi(l, idx, completedCount) {
+  // 续程时间线：前 completedCount 段为已完成部分，之后插入分隔标记
+  const done = !!l.completed;
+  const cls = ["leg", l.type, done ? "is-done" : "is-rest"].join(" ");
+  const badge = done
+    ? `<span class="done-flag">已完成</span>`
+    : `<span class="rest-flag">余程</span>`;
+  const divider =
+    renderDivider(idx, completedCount);
+  let body;
+  if (l.type === "wait") {
+    body = `
+      <span class="dot">等</span>
+      <div class="when">${hhmm(l.start)} – ${hhmm(l.end)}（${l.minutes} 分钟）</div>
+      <div class="what">站内候车 ${badge}</div>
+      <div class="meta">在 ${esc(sname(l.station))} 等待下一班</div>`;
+  } else if (l.type === "walk") {
+    body = `
+      <span class="dot">走</span>
+      <div class="when">${hhmm(l.depart)} – ${hhmm(l.arrive)}（${l.minutes} 分钟）</div>
+      <div class="what">步行换乘：${esc(sname(l.from))} → ${esc(sname(l.to))} ${badge}</div>
+      <div class="meta">步行 ${l.minutes} 分钟后于 ${hhmm(l.arrive)} 到达邻站方可乘车</div>`;
+  } else {
+    body = `
+      <span class="dot">乘</span>
+      <div class="when">${hhmm(l.depart)} 发车 · ${hhmm(l.arrive)} 到达（${l.minutes} 分钟）</div>
+      <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)} ${badge}</div>
+      <div class="meta">${esc(sname(l.from))} 上车 → ${esc(sname(l.to))} 下车</div>
+      ${l.truncated ? `<div class="meta trunc">⚠ ${esc(l.truncation)}</div>` : ""}`;
+  }
+  return `${divider}<li class="${cls}" data-leg-index="${idx}">${body}</li>`;
+}
+
+function renderDivider(idx, completedCount) {
+  if (completedCount && idx === completedCount) {
+    return `<li class="continue-divider"><span>—— 以下为当前时刻之后的余程 ——</span></li>`;
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------- 工具按钮
@@ -424,10 +555,12 @@ async function loadSample() {
   const resp = await fetch("/api/sample");
   data = await resp.json();
   lastResult = null;
+  continueReq = null;
   renderAll();
   els.earliest.value = "08:00";
   els.preference.value = "fastest";
   els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运），点击「规划行程」。</p>`;
+  els.continuePanel.hidden = true;
   els.recalc.hidden = true;
 }
 
@@ -435,8 +568,10 @@ function clearAll() {
   if (!confirm("确定清空全部站点、班次、换乘与停运记录？")) return;
   data = structuredClone(EMPTY_DATA);
   lastResult = null;
+  continueReq = null;
   renderAll();
   els.result.innerHTML = `<p class="empty">录入站点与班次后点击「规划行程」。</p>`;
+  els.continuePanel.hidden = true;
   els.recalc.hidden = true;
 }
 
@@ -464,6 +599,8 @@ els.fileImport.addEventListener("change", async (ev) => {
       suspensions: parsed.suspensions || [],
     };
     renderAll();
+    continueReq = null;
+    els.continuePanel.hidden = true;
     markStale();
   } catch (err) {
     showError(`导入失败：${err.message}`);

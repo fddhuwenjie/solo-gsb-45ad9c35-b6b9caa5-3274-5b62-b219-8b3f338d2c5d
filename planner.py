@@ -12,6 +12,12 @@
 
 搜索采用多标签时间依赖 Dijkstra，标签按所选偏好对应的三元组做帕累托支配剪枝；
 无解时汇总搜索过程中遇到的全部阻塞约束，返回时间最早的一个。
+
+行程续程（continue_trip）：途中停运或班次调整后，以原时间线中最后完成的乘车/步行段
+为界，已完成路段与候车记录原样沿用（只核对站点与时间连续性，不因新网络的变化而抹掉
+已走事实）；自该段到达站与用户填写的当前时刻起，在更新后的网络上搜索余程，累计整程
+换乘、步行与候车（含完成段至当前时刻的等待）。余程搜索中同一班次不得再经过已乘过的
+站段；接续无解时返回完成部分（含等待至当前时刻）与余程的首个阻塞约束。
 """
 
 from __future__ import annotations
@@ -410,25 +416,46 @@ class Planner:
             raise PlanError(f"终点站不存在：{destination}")
         if preference not in PREFERENCE_FIELDS:
             raise PlanError(f"未知偏好：{preference}")
+        result = self._search_core(
+            origin, destination, earliest, preference, frozenset(),
+            start_noun="起点站", start_action="start", start_window_action="出发")
+        if result["status"] != "ok":
+            return result
+        return {"status": "ok", "explored": result["explored"],
+                "itinerary": self._itinerary(origin, destination, earliest,
+                                             preference, result["chain"],
+                                             result["rides"], result["walk"],
+                                             result["arrival"])}
 
-        # 起点自身在出发时刻即停运：任何方案都不可能成立
+    def _search_core(self, origin: str, destination: str, earliest: int,
+                     preference: str, initial_ridden: frozenset,
+                     start_noun: str, start_action: str,
+                     start_window_action: str) -> dict:
+        """从 (origin, earliest) 出发的多标签时间依赖搜索。
+
+        initial_ridden 为已乘过的 (班次ID, 站段下标) 集合：余程中同一班次
+        不得再经过这些站段（续程绕行后重乘同一班次时尤为关键）。
+        成功返回 {"status": "ok", "chain", "rides", "walk", "arrival",
+        "explored", "blockers"}；起点停运立即返回 blocked。
+        """
+        # 出发站在出发时刻即停运：任何方案都不可能成立
         open_at_start, window = self.station_open(origin, earliest)
         if not open_at_start:
             return self._blocked({
                 "kind": "origin_closed",
-                "action": "start",
+                "action": start_action,
                 "station": origin,
                 "time": earliest,
                 "window": window,
                 "message": (
-                    f"起点站 {self.sname(origin)} 在 {to_hhmm(earliest)} 处于临时停运时段"
-                    f"{self._window_text(window)}，无法出发。"
+                    f"{start_noun} {self.sname(origin)} 在 {to_hhmm(earliest)} 处于临时停运时段"
+                    f"{self._window_text(window)}，无法{start_window_action}。"
                 ),
             })
 
         if origin == destination:
-            return {"status": "ok", "itinerary": self._itinerary(
-                origin, destination, earliest, preference, (), 0)}
+            return {"status": "ok", "chain": (), "rides": 0, "walk": 0,
+                    "arrival": earliest, "explored": 0, "blockers": {}}
 
         blockers: dict[tuple, dict] = {}
 
@@ -450,15 +477,19 @@ class Planner:
 
         def dominates(a: dict, b: dict) -> bool:
             va, vb = list(vec(a)), list(vec(b))
-            return all(x <= y for x, y in zip(va, vb)) and va != vb
+            # 三元组不劣、且已乘站段集合为子集才可能支配；集合严格包含也视为
+            # 支配（约束更少），完全相同的三元组+集合只保留最先产生的标签。
+            return (all(x <= y for x, y in zip(va, vb))
+                    and a["ridden"] <= b["ridden"]
+                    and (va != vb or a["ridden"] != b["ridden"]))
 
         def key_tuple(label: dict) -> tuple:
-            return tuple(vec(label))
+            return tuple(vec(label)) + (label["ridden"],)
 
-        # 标签：站点、到达时刻、乘坐班次数、累计步行分钟、上次班次及其下车下标、链
+        # 标签：站点、到达时刻、乘坐班次数、累计步行分钟、已乘站段集合、链
         start_label = {
             "uid": 0, "station": origin, "arrival": earliest,
-            "rides": 0, "walk": 0, "last_trip": None, "last_alight": -1,
+            "rides": 0, "walk": 0, "ridden": frozenset(initial_ridden),
             "chain": (),
         }
         buckets: dict[str, list[dict]] = {s: [] for s in self.n["stations"]}
@@ -466,17 +497,15 @@ class Planner:
 
         heap: list[tuple] = []
         counter = count(1)
-        heapq.heappush(heap, (earliest, 0, start_label["uid"], start_label))
+        heapq.heappush(heap, (earliest, start_label["uid"], start_label))
         uid_of = {0: start_label}
         explored = 0
 
         def try_extend(label: dict, station: str, arrival: int, rides: int,
-                       walk: int, last_trip: str | None, last_alight: int,
-                       step: dict) -> None:
+                       walk: int, ridden: frozenset, step: dict) -> None:
             new_label = {
                 "uid": next(counter), "station": station, "arrival": arrival,
-                "rides": rides, "walk": walk, "last_trip": last_trip,
-                "last_alight": last_alight,
+                "rides": rides, "walk": walk, "ridden": ridden,
                 "chain": label["chain"] + (step,),
             }
             bucket = buckets[station]
@@ -489,11 +518,10 @@ class Planner:
                     bucket.remove(existing)
             bucket.append(new_label)
             uid_of[new_label["uid"]] = new_label
-            heapq.heappush(heap, (arrival, new_label["uid"],
-                                  new_label["uid"], new_label))
+            heapq.heappush(heap, (arrival, new_label["uid"], new_label))
 
         while heap:
-            _, _, uid, label = heapq.heappop(heap)
+            _, uid, label = heapq.heappop(heap)
             if not any(b["uid"] == uid for b in buckets[label["station"]]):
                 continue  # 已被更优标签支配
             explored += 1
@@ -517,8 +545,7 @@ class Planner:
                     })
                     continue
                 try_extend(label, neighbor, arrival, label["rides"],
-                           label["walk"] + minutes, label["last_trip"],
-                           label["last_alight"],
+                           label["walk"] + minutes, label["ridden"],
                            {"type": "walk", "from": station, "to": neighbor,
                             "depart": ready, "arrive": arrival,
                             "minutes": minutes})
@@ -529,10 +556,8 @@ class Planner:
                 dep = trip["stops"][idx]["time"]
                 if dep < ready:
                     continue  # 已发车
-                if (trip_id == label["last_trip"]
-                        and idx <= label["last_alight"]):
-                    continue  # 同班次已乘过的区段不重复乘坐；但因区段停运
-                    # 提前下车、步行绕行后，仍可在更靠后的经停站重新上车
+                # 注：已乘站段在下方延伸循环中拦截——在原下车站重新登车
+                # 向前乘坐未乘过的站段是允许的（区段停运步行绕行后重乘）。
 
                 # 本站上车时站点必须开放
                 open_board, win_board = self.station_open(station, dep)
@@ -567,7 +592,11 @@ class Planner:
                 # 延伸到后续每个（到站时开放的）经停站；停运站跳站通过。
                 # 线路区段停运的封锁站段不可穿越：乘车段最远生成到封锁段
                 # 起点站（班次不整班取消），之后由步行或其他班次接续。
+                # 已乘过的站段同样不可再次经过（续程重乘同一班次）。
+                new_segments: set = set()
                 for j in range(idx + 1, len(trip["stops"])):
+                    if (trip_id, j - 1) in label["ridden"]:
+                        break
                     closure = self.segment_closure(trip_id, j - 1)
                     if closure is not None:
                         seg_from = trip["stops"][j - 1]["station"]
@@ -613,10 +642,14 @@ class Planner:
                                 f"{self._window_text(win_alight)}，班次跳站通过，不能下车。"
                             ),
                         })
+                        new_segments.add(j - 1)
                         continue
+                    new_segments.add(j - 1)
                     try_extend(
                         label, target, arrive_at, label["rides"] + 1,
-                        label["walk"], trip_id, j,
+                        label["walk"],
+                        label["ridden"] | frozenset(
+                            (trip_id, s) for s in new_segments),
                         {"type": "ride", "trip_id": trip_id,
                          "route": trip["route"], "from": station,
                          "to": target, "depart": dep, "arrive": arrive_at,
@@ -626,30 +659,33 @@ class Planner:
         if not candidates:
             return {"status": "blocked",
                     "blocker": self._first_blocker(blockers, origin,
-                                                   destination, earliest)}
+                                                   destination, earliest,
+                                                   start_noun=start_noun,
+                                                   start_action=start_action),
+                    "explored": explored}
 
         best = min(candidates, key=lambda lb: (
             tuple([{"arrival": lb["arrival"],
                     "transfers": max(0, lb["rides"] - 1),
                     "walking": lb["walk"]}[f] for f in order]),
             lb["uid"]))
-        return {"status": "ok", "explored": explored,
-                "itinerary": self._itinerary(origin, destination, earliest,
-                                             preference, best["chain"],
-                                             best["rides"], best["walk"],
-                                             best["arrival"])}
+        return {"status": "ok", "chain": best["chain"], "rides": best["rides"],
+                "walk": best["walk"], "arrival": best["arrival"],
+                "explored": explored, "blockers": blockers}
 
     # ------------------------------------------------------------------ #
     def _first_blocker(self, blockers: dict, origin: str,
-                       destination: str, earliest: int) -> dict:
+                       destination: str, earliest: int,
+                       start_noun: str = "起点站",
+                       start_action: str = "start") -> dict:
         items = list(blockers.values())
 
-        # 结构性阻塞：起终点根本没有班次服务
+        # 结构性阻塞：出发站根本没有班次服务
         if not self.n["departures"].get(origin):
             return {
-                "kind": "no_service", "action": "start", "station": origin,
+                "kind": "no_service", "action": start_action, "station": origin,
                 "time": earliest, "trip_id": None, "window": None,
-                "message": f"起点站 {self.sname(origin)} 没有任何经停班次，无法出发。",
+                "message": f"{start_noun} {self.sname(origin)} 没有任何经停班次，无法出发。",
             }
         later_exists = any(
             self.n["trips"][tid]["stops"][idx]["time"] >= earliest
@@ -658,7 +694,7 @@ class Planner:
         if not later_exists and not any(
                 b.get("station") == origin for b in items):
             return {
-                "kind": "no_service_after", "action": "start",
+                "kind": "no_service_after", "action": start_action,
                 "station": origin, "time": earliest, "trip_id": None,
                 "window": None,
                 "message": (
@@ -752,4 +788,270 @@ class Planner:
             "walking_minutes": walk or total_walk,
             "waiting_minutes": total_wait,
             "legs": legs,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 行程续程：停运 / 班次调整后从已走完的路段接续
+    # ------------------------------------------------------------------ #
+    def continue_trip(self, original: dict, destination: str | None,
+                      completed_index: int, current_time: int,
+                      preference: str) -> dict:
+        """以原时间线中最后完成的乘车/步行段为界发起续程。
+
+        - 已完成路段与候车记录原样沿用，只核对站点与时间连续性，不因更新后
+          网络中的新停运 / 班次调整而抹掉已走事实；
+        - 当前时刻不得早于最后完成段的到达时刻，差值计为在所在站的候车；
+        - 从所在站与当前时刻在更新后的网络上搜索余程，整程的换乘、步行、
+          候车统一累计；同一班次绕行后重乘时不得回到已乘过的站段；
+        - 接续无解时返回完成部分（含等待至当前时刻）与余程首个阻塞约束。
+        """
+        if not isinstance(original, dict):
+            raise PlanError("原行程必须为规划结果中的 itinerary 对象")
+        legs = original.get("legs")
+        if not isinstance(legs, list) or not legs:
+            raise PlanError("原行程缺少时间线 legs，无法续程")
+        if isinstance(completed_index, bool) or not isinstance(completed_index, int):
+            raise PlanError("完成段下标 completed_index 必须为整数")
+        if not 0 <= completed_index < len(legs):
+            raise PlanError(
+                f"完成段下标超出时间线范围（0–{len(legs) - 1}）：{completed_index}")
+        chosen = legs[completed_index]
+        if not isinstance(chosen, dict) or chosen.get("type") not in ("ride", "walk"):
+            raise PlanError("最后完成的一段必须是乘车段或步行段（候车段不可选）")
+        if preference not in PREFERENCE_FIELDS:
+            raise PlanError(f"未知偏好：{preference}")
+
+        if destination is None:
+            destination = original.get("destination", "")
+        destination = str(destination).strip()
+        if not destination:
+            raise PlanError("缺少终点站")
+        if destination not in self.names:
+            raise PlanError(f"终点站不存在：{destination}")
+
+        # ---- 核对并固化已完成前缀（站点 / 时间连续性）----
+        prefix, origin, last_arrival = self._validate_completed_prefix(
+            legs, completed_index)
+
+        if current_time < last_arrival:
+            raise PlanError(
+                f"当前时刻 {to_hhmm(current_time)} 早于最后完成段的到达时刻 "
+                f"{to_hhmm(last_arrival)}，时间不能倒流")
+
+        at_station = prefix[-1]["to"]
+
+        earliest = original.get("earliest")
+        if isinstance(earliest, str):
+            earliest = parse_time(earliest, "原行程最早出发时刻")
+        elif not isinstance(earliest, int):
+            first = prefix[0]
+            earliest = first.get("start", first.get("depart", 0))
+
+        # 已到达（新）终点：余程为空，完成段之后不再产生候车
+        if at_station == destination:
+            itin = self._continue_itinerary(
+                origin, destination, earliest, preference, prefix, None,
+                last_arrival, (), last_arrival)
+            return {"status": "ok", "explored": 0, "itinerary": itin}
+
+        # 完成段至当前时刻的等待：在所在站等待，属于已发生事实
+        gap: dict | None = None
+        if current_time > last_arrival:
+            gap = {"type": "wait", "station": at_station,
+                   "start": last_arrival, "end": current_time,
+                   "minutes": current_time - last_arrival,
+                   "completed": True}
+
+        # 已乘过的站段映射到更新后的同班次经停序列，余程不得重乘
+        ridden = self._ridden_from_prefix(prefix)
+
+        search = self._search_core(
+            at_station, destination, current_time, preference, ridden,
+            start_noun="当前所在站", start_action="continue",
+            start_window_action="继续出行")
+
+        if search["status"] == "blocked":
+            itin = self._continue_itinerary(
+                origin, destination, earliest, preference, prefix, gap,
+                current_time, (), None)
+            return {"status": "blocked", "blocker": search["blocker"],
+                    "itinerary": itin}
+
+        itin = self._continue_itinerary(
+            origin, destination, earliest, preference, prefix, gap,
+            current_time, search["chain"], search["arrival"])
+        return {"status": "ok", "explored": search["explored"],
+                "itinerary": itin}
+
+    def _validate_completed_prefix(self, legs: list, completed_index: int
+                                   ) -> tuple[list[dict], str, int]:
+        """核对 legs[:completed_index+1] 的站点与时间连续性。
+
+        返回 (规范化后的完成段列表, 起点站, 最后到达时刻)。
+        候车段沿用原记录；完成段涉及的站点必须仍存在于更新后的网络。
+        """
+        prefix: list[dict] = []
+        cursor: int | None = None
+        prev_station: str | None = None
+        origin: str | None = None
+
+        def tm(leg: dict, field: str, no: int) -> int:
+            value = leg.get(field)
+            if value is None:
+                raise PlanError(f"原时间线第 {no} 段缺少时刻字段 {field}")
+            return parse_time(value, f"原时间线第 {no} 段 {field}")
+
+        def require_station(sid: str, no: int) -> str:
+            sid = str(sid or "").strip()
+            if not sid:
+                raise PlanError(f"原时间线第 {no} 段缺少站点")
+            if sid not in self.names:
+                raise PlanError(
+                    f"已完成部分引用了更新后网络中不存在的站点：{sid}，"
+                    "已走事实保留，但请先在站点表中补回该站")
+            return sid
+
+        for k in range(completed_index + 1):
+            no = k + 1
+            leg = legs[k]
+            if not isinstance(leg, dict):
+                raise PlanError(f"原时间线第 {no} 段格式不合法")
+            ltype = leg.get("type")
+            if ltype == "wait":
+                station = require_station(leg.get("station"), no)
+                start = tm(leg, "start", no)
+                end = tm(leg, "end", no)
+                if end <= start:
+                    raise PlanError(f"原时间线第 {no} 段候车时长必须为正")
+                if cursor is not None and start != cursor:
+                    raise PlanError(
+                        f"已完成部分时间不连续：第 {no} 段候车始于 "
+                        f"{to_hhmm(start)}，而上一段于 {to_hhmm(cursor)} 结束")
+                if prev_station is not None and station != prev_station:
+                    raise PlanError(
+                        f"已完成部分站点不连续：第 {no} 段在 {station} 候车，"
+                        f"而上一段终于 {prev_station}")
+                prefix.append({"type": "wait", "station": station,
+                               "start": start, "end": end,
+                               "minutes": end - start, "completed": True})
+                cursor, prev_station = end, station
+                if origin is None:
+                    origin = station
+                continue
+
+            if ltype not in ("ride", "walk"):
+                raise PlanError(
+                    f"原时间线第 {no} 段类型必须是 wait / ride / walk：{ltype!r}")
+            frm = require_station(leg.get("from"), no)
+            to = require_station(leg.get("to"), no)
+            if frm == to:
+                raise PlanError(f"原时间线第 {no} 段的起终点相同：{frm}")
+            depart = tm(leg, "depart", no)
+            arrive = tm(leg, "arrive", no)
+            if arrive <= depart:
+                raise PlanError(f"原时间线第 {no} 段到达时刻必须晚于出发时刻")
+            if cursor is not None and depart != cursor:
+                raise PlanError(
+                    f"已完成部分时间不连续：第 {no} 段于 {to_hhmm(depart)} 出发，"
+                    f"而上一段于 {to_hhmm(cursor)} 结束")
+            if prev_station is not None and frm != prev_station:
+                raise PlanError(
+                    f"已完成部分站点不连续：第 {no} 段从 {frm} 出发，"
+                    f"而上一段终于 {prev_station}")
+
+            out: dict = {"type": ltype, "from": frm, "to": to,
+                         "depart": depart, "arrive": arrive,
+                         "minutes": arrive - depart, "completed": True}
+            if ltype == "ride":
+                trip_id = str(leg.get("trip_id", "")).strip()
+                if not trip_id:
+                    raise PlanError(f"原时间线第 {no} 段缺少班次 ID")
+                out["trip_id"] = trip_id
+                out["route"] = str(leg.get("route") or trip_id).strip() or trip_id
+                # 原时间线中的区段截断标注是已走事实的一部分，原样保留
+                if leg.get("truncated"):
+                    out["truncated"] = True
+                    if leg.get("truncation"):
+                        out["truncation"] = str(leg["truncation"])
+            prefix.append(out)
+            cursor, prev_station = arrive, to
+            if origin is None:
+                origin = frm
+
+        return prefix, origin or "", cursor or 0
+
+    def _ridden_from_prefix(self, prefix: list[dict]) -> frozenset:
+        """把完成前缀中的乘车段映射为更新后网络同班次经停下标区间。
+
+        班次已取消或经停顺序调整到无法对应时，该段不施加重乘限制
+        （已走事实本身仍原样保留在时间线中）。
+        """
+        ridden: set[tuple[str, int]] = set()
+        for leg in prefix:
+            if leg["type"] != "ride":
+                continue
+            trip = self.n["trips"].get(leg["trip_id"])
+            if trip is None:
+                continue
+            seq = [s["station"] for s in trip["stops"]]
+            if leg["from"] not in seq or leg["to"] not in seq:
+                continue
+            i, j = seq.index(leg["from"]), seq.index(leg["to"])
+            if i >= j:
+                continue
+            for seg in range(i, j):
+                ridden.add((leg["trip_id"], seg))
+        return frozenset(ridden)
+
+    def _continue_itinerary(self, origin: str, destination: str,
+                            earliest: int, preference: str,
+                            prefix: list[dict], gap: dict | None,
+                            current_time: int, rest_chain: tuple,
+                            arrival: int | None) -> dict:
+        """拼装续程时间线：完成前缀 + 等待至当前时刻 + 余程。
+
+        完成部分各段带 completed=true；余程段（含余程候车）不带该标记。
+        """
+        out_legs: list[dict] = list(prefix)
+        if gap is not None:
+            out_legs.append(gap)
+        completed_count = len(out_legs)
+
+        cursor = current_time
+        for step in rest_chain:
+            if step["depart"] > cursor:
+                wait = step["depart"] - cursor
+                out_legs.append({"type": "wait", "station": step["from"],
+                                 "start": cursor, "end": step["depart"],
+                                 "minutes": wait})
+            leg = dict(step)
+            if leg["type"] == "ride":
+                note = self._truncation_note(leg)
+                if note:
+                    leg["truncated"] = True
+                    leg["truncation"] = note
+            out_legs.append(leg)
+            cursor = step["arrive"]
+
+        rides = sum(1 for l in out_legs if l["type"] == "ride")
+        walking = sum(l["minutes"] for l in out_legs if l["type"] == "walk")
+        waiting = sum(l["minutes"] for l in out_legs if l["type"] == "wait")
+
+        at_station = prefix[-1]["to"]
+        return {
+            "continuation": True,
+            "origin": origin,
+            "destination": destination,
+            "earliest": earliest,
+            "preference": preference,
+            "preference_label": PREFERENCE_LABELS[preference],
+            "resume_station": at_station,
+            "resume_time": current_time,
+            "completed_count": completed_count,
+            "arrival": arrival,
+            "rides": rides,
+            "transfers": max(0, rides - 1),
+            "walking_minutes": walking,
+            "waiting_minutes": waiting,
+            "legs": out_legs,
         }

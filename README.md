@@ -49,6 +49,33 @@ python app.py
 **修改任何输入后可再次点击直接重算**，页面会提示“结果待重算”。
 工具栏支持载入示例、清空、导入 / 导出 JSON。
 
+### 行程途中停运 / 班次调整后的续程
+
+规划结果下方的「⑦ 行程续程」面板支持在**行程途中发生停运或班次调整**后接续出行：
+
+1. 先在左侧修改站点、线路班次或临时停运信息（更新后的网络）；
+2. 在「最后完成段」下拉中选定已规划时间线上**最后完成的乘车或步行段**
+   （候车段不可选），页面会把当前时刻自动填为该段到达时刻，可再向后调；
+3. 选择余程偏好后点击 **发起续程**。
+
+续程规则：
+
+- **已走事实不抹掉**：完成段及其之前的候车记录原样沿用，只核对站点与时间
+  连续性；即使该班次之后被删除 / 调整、路段被新增停运封锁，完成部分仍按
+  原时间线展示（带「已完成」标记）；
+- **当前时刻不得早于**最后完成段的到达时刻，完成段到达至当前时刻之间的
+  在站等待计入整程候车；
+- 自所在站与当前时刻在**更新后的网络**上搜索余程，整程的换乘次数、步行与
+  候车分钟统一累计；
+- 若步行绕行后重新登上同一班次，只允许乘坐**尚未乘过的站段**，不得回到
+  已乘过的站段（例如已乘 A→B，就不能走回 A 再乘 A→B；但可以在 B 重新
+  登车继续乘 B→E，或步行绕过后在更靠后的经停站重乘同一班次）；
+- **接续无解**时仍完整展示完成部分（含等待至当前时刻），并给出余程的
+  首个阻塞原因；未走路段一律不会被标记为完成。
+
+续程结果本身也可再次作为原行程继续续程；重新点击「规划行程」则按当前
+网络从头规划。
+
 ### 偏好与字典序取解
 
 | 偏好 | 字典序（从主到次） |
@@ -82,6 +109,7 @@ python app.py
 - `GET /` — 页面
 - `GET /api/sample` — 内置示例数据
 - `POST /api/plan` — 规划
+- `POST /api/continue` — 行程途中停运 / 班次调整后的续程
 
 `/api/plan` 请求体：
 
@@ -170,6 +198,99 @@ curl -X POST http://localhost:8000/api/plan \
   "time": 535,
   "message": "班次 K2b（2路）于 08:55 到达 人民广场 后，前方 人民广场→火车北站 站段被线路区段停运封锁（2路 人民广场→火车北站 08:50–09:10，区间临时管制）…"}}
 ```
+
+### `/api/continue` 续程接口
+
+请求体：
+
+```json
+{
+  "itinerary": { ... },          // 原 /api/plan（或上次 /api/continue）返回的 itinerary
+  "data": { ... },               // 更新后的网络：站点 / 班次 / 步行 / 停运
+  "continue": {
+    "completed_index": 1,        // 原时间线 legs 中最后完成的乘车/步行段下标（候车段不可选）
+    "current_time": "09:00",     // 当前时刻，不得早于该完成段的到达时刻
+    "preference": "fastest",     // 余程偏好；可选，缺省 fastest
+    "destination": "S6"          // 余程终点；可选，缺省沿用原 itinerary.destination
+  }
+}
+```
+
+返回与 `/api/plan` 同构的 `ok` / `blocked` / `error`，其中 `itinerary` 额外
+携带续程信息：
+
+- `continuation: true`、`resume_station` / `resume_time`：续程起点与当前时刻；
+- `completed_count`：时间线前段中被锁定为「已完成」的段数（含完成段之后
+  至当前时刻的在站等待），这些段带 `"completed": true`；
+- `rides` / `transfers` / `walking_minutes` / `waiting_minutes` 为**整程**
+  累计（已完成部分 + 余程）；
+- 接续无解时状态为 `blocked`：`blocker` 给出余程首个阻塞约束，
+  `itinerary` 仍包含完成部分（`arrival` 为 `null`，未走路段不会出现）。
+
+#### 续程调用示例
+
+先规划，拿到原时间线（示例网络中 K2b 因 2路 S4→S6 区段停运，在 S4 截断，
+步行到 S5 换 K4）：
+
+```bash
+curl -X POST http://localhost:8000/api/plan \
+  -H "Content-Type: application/json" \
+  -d '{"query": {"origin": "S1", "destination": "S6",
+                 "earliest": "08:30", "preference": "fastest"},
+       "data": <内置示例 /api/sample 的 JSON>}'
+```
+
+途中情况变化：人已乘 K2b 到达 S4（legs 下标 1 的乘车段），当前时刻 09:00；
+此时 4路 又全线停运。把更新后的停运与**原 itinerary** 一起提交：
+
+```bash
+curl -X POST http://localhost:8000/api/continue \
+  -H "Content-Type: application/json" \
+  -d '{
+    "itinerary": {"origin": "S1", "destination": "S6", "earliest": 510,
+      "preference": "fastest", "arrival": 552,
+      "rides": 2, "transfers": 1, "walking_minutes": 7, "waiting_minutes": 7,
+      "legs": [
+        {"type": "wait", "station": "S1", "start": 510, "end": 518, "minutes": 8},
+        {"type": "ride", "trip_id": "K2b", "route": "2路",
+         "from": "S1", "to": "S4", "depart": 518, "arrive": 535,
+         "minutes": 17, "truncated": true,
+         "truncation": "受 2路 区段停运（人民广场→火车北站 08:50–09:10）影响，本次乘车在 人民广场 终止，需步行或换乘其他班次继续。"},
+        {"type": "walk", "from": "S4", "to": "S5",
+         "depart": 535, "arrive": 542, "minutes": 7},
+        {"type": "wait", "station": "S5", "start": 542, "end": 545, "minutes": 3},
+        {"type": "ride", "trip_id": "K4", "route": "4路",
+         "from": "S5", "to": "S6", "depart": 545, "arrive": 552, "minutes": 7}]},
+    "data": { "...": "在示例数据基础上新增 {\"kind\":\"route\",\"ref\":\"4路\",\"start\":\"00:00\",\"end\":\"23:59\"}" },
+    "continue": {"completed_index": 1, "current_time": "09:00",
+                 "preference": "fastest"}
+  }'
+```
+
+返回（节选）：K2b 的 S1→S4 乘车段与 S1 候车段原样保留为已完成，08:55→09:00
+在 S4 的等待计入整程候车；余程按更新后的网络重新搜索。若余程无解（例如
+4路停运且无其他接续），返回：
+
+```json
+{"status": "blocked",
+ "blocker": {"kind": "route_suspended", "trip_id": "K4", "time": 545,
+             "message": "班次 K4（4路）原定于 09:05 从 大学城 发车，但线路在临时停运区间00:00–23:59内，该班次被跳过。"},
+ "itinerary": {"continuation": true, "resume_station": "S4",
+               "resume_time": 540, "completed_count": 3, "arrival": null,
+               "rides": 1, "transfers": 0,
+               "walking_minutes": 0, "waiting_minutes": 13,
+               "legs": [
+                 {"type": "wait", "station": "S1", "start": 510, "end": 518,
+                  "minutes": 8, "completed": true},
+                 {"type": "ride", "trip_id": "K2b", "route": "2路",
+                  "from": "S1", "to": "S4", "depart": 518, "arrive": 535,
+                  "truncated": true, "completed": true},
+                 {"type": "wait", "station": "S4", "start": 535, "end": 540,
+                  "minutes": 5, "completed": true}]}}
+```
+
+常见 400 错误：完成段下标越界 / 指向候车段、当前时刻早于最后到达时刻、
+完成前缀站点或时间不连续、完成段引用了更新后网络中不存在的站点。
 
 ## 目录结构
 
